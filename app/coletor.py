@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BAC BO — Serviço de Coleta (versão leve com requests+BS4)
-=========================================================
-Raspa o resultado mais recente do Bac Bo no TipMiner via requests/BeautifulSoup.
+BAC BO — Serviço de Coleta (Playwright)
+========================================
+Raspa o resultado mais recente do Bac Bo no TipMiner via Playwright (browser headless).
+Necessário porque o site renderiza os dados via JavaScript no cliente.
 Salva no banco PostgreSQL. Roda a cada 30s via APScheduler.
 """
 
-import json
 import logging
 import os
 import re
 from datetime import datetime, timezone
 
-import requests
-from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 from apscheduler.schedulers.blocking import BlockingScheduler
 from sqlalchemy import create_engine, text, String, DateTime, Integer, func
 from sqlalchemy.orm import sessionmaker, DeclarativeBase, Mapped, mapped_column
@@ -33,24 +32,6 @@ logger = logging.getLogger(__name__)
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 INTERVALO_SEGUNDOS = int(os.environ.get("COLLECT_INTERVAL_SECONDS", "30"))
 URL_TIPMINER = "https://www.tipminer.com/br/historico/blaze/bac-bo-ao-vivo"
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1",
-}
 
 if not DATABASE_URL:
     raise RuntimeError("❌ Variável DATABASE_URL não configurada!")
@@ -77,7 +58,7 @@ class Resultado(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     resultado: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
-    horario: Mapped[str] = mapped_column(String(10), nullable=True)   # ex: "13:09"
+    horario: Mapped[str] = mapped_column(String(10), nullable=True)
     fonte: Mapped[str] = mapped_column(String(100), nullable=False, default="scraping")
     timestamp: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
@@ -93,7 +74,7 @@ def init_db():
 
 
 # ============================================================
-# SCRAPER — requests + BeautifulSoup (sem Playwright)
+# SCRAPER — Playwright (browser headless real)
 # ============================================================
 
 def _mapear_resultado(title: str) -> str | None:
@@ -109,178 +90,93 @@ def _mapear_resultado(title: str) -> str | None:
 
 
 def _extrair_horario(title: str) -> str | None:
-    """Extrai 'HH:MM' do atributo title, ex: 'BANKER - 13:09'."""
+    """Extrai HH:MM do atributo title, ex: 'BANKER - 5 - 13:09'."""
     m = re.search(r"(\d{1,2}:\d{2})", title)
     return m.group(1) if m else None
 
 
 def scrape() -> dict | None:
     """
-    Tenta 3 fontes em cascata:
-      1. API JSON interna do TipMiner (mais confiável)
-      2. HTML com atributo title="BANKER - 13:09"
-      3. HTML com padrão title="PLAYER - N - HH:MM" em qualquer tag
-    Retorna dict {"resultado": ..., "horario": ...} ou None.
+    Abre o TipMiner com Playwright, aguarda as bolinhas renderizarem
+    (classes bg-cell-player / bg-cell-banker / bg-cell-tie) e retorna
+    o resultado mais recente.
     """
-
-    # ------------------------------------------------------------------
-    # Fonte 1 — API JSON do TipMiner
-    # ------------------------------------------------------------------
-    API_URLS = [
-        "https://www.tipminer.com/api/historico/blaze/bac-bo-ao-vivo",
-        "https://www.tipminer.com/api/bac-bo/resultados",
-        "https://www.tipminer.com/api/blaze/bac-bo",
-    ]
-    for api_url in API_URLS:
-        try:
-            r = requests.get(api_url, headers=HEADERS, timeout=10)
-            if r.status_code == 200 and "application/json" in r.headers.get("Content-Type", ""):
-                data = r.json()
-                logger.info(f"[SCRAPER] API JSON OK: {api_url}")
-                # Tenta pegar o último item da lista
-                items = data if isinstance(data, list) else data.get("data", data.get("results", []))
-                if items:
-                    ultimo = items[-1] if isinstance(items, list) else items
-                    # Campos possíveis: result, resultado, winner, outcome
-                    raw = (
-                        ultimo.get("result") or ultimo.get("resultado") or
-                        ultimo.get("winner") or ultimo.get("outcome") or ""
-                    ).upper()
-                    resultado = _mapear_resultado(raw)
-                    # Horário: created_at, hora, time, timestamp
-                    hora_raw = (
-                        ultimo.get("hora") or ultimo.get("time") or
-                        ultimo.get("created_at") or ultimo.get("timestamp") or ""
-                    )
-                    horario = _extrair_horario(str(hora_raw))
-                    if resultado:
-                        logger.info(f"[SCRAPER] ✅ API JSON → {resultado} @ {horario}")
-                        return {"resultado": resultado, "horario": horario, "title": raw}
-        except Exception:
-            pass
-
-    # ------------------------------------------------------------------
-    # Fonte 2 — HTML scraping (página renderizada pelo servidor)
-    # ------------------------------------------------------------------
     try:
-        logger.info("[SCRAPER] Acessando TipMiner via requests...")
-        resp = requests.get(URL_TIPMINER, headers=HEADERS, timeout=20)
-        resp.raise_for_status()
-        logger.info(f"[SCRAPER] HTTP {resp.status_code} — {len(resp.text)} bytes recebidos")
-    except requests.RequestException as e:
-        logger.error(f"[SCRAPER] ❌ Falha no request: {e}")
-        return None
-
-    html = resp.text
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Estratégia 2a: divs com classe bg-cell-player / bg-cell-banker / bg-cell-tie
-    # Estrutura real do TipMiner: <div class="... bg-cell-player ..." title="PLAYER - 6 - 15:24">
-    CLASSES_CELULA = ["bg-cell-player", "bg-cell-banker", "bg-cell-tie"]
-    candidatos_css = []
-    for classe in CLASSES_CELULA:
-        for tag in soup.find_all(class_=re.compile(classe)):
-            title = tag.get("title", "")
-            resultado = _mapear_resultado(title)
-            horario = _extrair_horario(title)
-            if resultado:
-                candidatos_css.append({
-                    "resultado": resultado,
-                    "horario": horario,
-                    "title": title,
-                })
-
-    if candidatos_css:
-        com_hora = [c for c in candidatos_css if c["horario"]]
-        sem_hora = [c for c in candidatos_css if not c["horario"]]
-        if com_hora:
-            mais_recente = sorted(com_hora, key=lambda x: x["horario"])[-1]
-            logger.info(
-                f"[SCRAPER] ✅ {len(com_hora)} resultados (bg-cell+horario). "
-                f"Mais recente: {mais_recente['resultado']} @ {mais_recente['horario']}"
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--no-zygote",
+                    "--single-process",
+                ],
             )
-            return mais_recente
-        else:
-            mais_recente = sem_hora[-1]
-            logger.info(
-                f"[SCRAPER] ✅ {len(sem_hora)} resultados (bg-cell sem horario). "
-                f"Mais recente: {mais_recente['resultado']}"
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                locale="pt-BR",
+                viewport={"width": 1280, "height": 800},
             )
-            return mais_recente
+            page = context.new_page()
 
-    # Estratégia 2b: qualquer tag com atributo title contendo PLAYER/BANKER/TIE + horário
-    candidatos = []
-    for tag in soup.find_all(title=True):
-        title = tag.get("title", "")
-        resultado = _mapear_resultado(title)
-        horario = _extrair_horario(title)
-        if resultado and horario:
-            candidatos.append({"resultado": resultado, "horario": horario, "title": title})
+            logger.info("[SCRAPER] Abrindo TipMiner com Playwright...")
+            page.goto(URL_TIPMINER, wait_until="domcontentloaded", timeout=30000)
 
-    if candidatos:
-        mais_recente = candidatos[-1]
-        logger.info(
-            f"[SCRAPER] ✅ {len(candidatos)} resultados (title+horario). "
-            f"Mais recente: {mais_recente['resultado']} @ {mais_recente['horario']}"
-        )
-        return mais_recente
+            # Aguarda aparecer pelo menos uma bolinha de resultado
+            seletor = "div.bg-cell-player, div.bg-cell-banker, div.bg-cell-tie"
+            try:
+                page.wait_for_selector(seletor, timeout=20000)
+                logger.info("[SCRAPER] Bolinhas de resultado encontradas ✅")
+            except PlaywrightTimeout:
+                logger.warning("[SCRAPER] ⚠️  Timeout aguardando bolinhas — tentando mesmo assim...")
 
-    # Estratégia 2c: title sem horário (aceita mesmo sem hora)
-    candidatos_sem_hora = []
-    for tag in soup.find_all(title=True):
-        title = tag.get("title", "")
-        resultado = _mapear_resultado(title)
-        if resultado:
-            candidatos_sem_hora.append({"resultado": resultado, "horario": None, "title": title})
+            # Coleta todos os títulos das bolinhas
+            titulos = page.eval_on_selector_all(
+                seletor,
+                "elements => elements.map(e => e.getAttribute('title')).filter(Boolean)"
+            )
 
-    if candidatos_sem_hora:
-        mais_recente = candidatos_sem_hora[-1]
-        logger.info(
-            f"[SCRAPER] ✅ {len(candidatos_sem_hora)} resultados (title sem horario). "
-            f"Mais recente: {mais_recente['resultado']}"
-        )
-        return mais_recente
+            browser.close()
 
-    # Estratégia 2c: dados embutidos no HTML como JSON (Next.js __NEXT_DATA__)
-    match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
-    if match:
-        try:
-            next_data = json.loads(match.group(1))
-            # Navega pela estrutura tentando achar lista de resultados
-            raw_str = json.dumps(next_data)
-            titulos = re.findall(r'"(?:result|resultado|winner)["\s]*:\s*"([^"]+)"', raw_str, re.I)
-            horas = re.findall(r'"(?:hora|time|created_at)["\s]*:\s*"([^"]+)"', raw_str, re.I)
-            if titulos:
-                resultado = _mapear_resultado(titulos[-1])
-                horario = _extrair_horario(horas[-1]) if horas else None
+            if not titulos:
+                logger.warning("[SCRAPER] ❌ Nenhuma bolinha encontrada no HTML renderizado.")
+                return None
+
+            logger.info(f"[SCRAPER] {len(titulos)} bolinhas encontradas.")
+
+            candidatos_com_hora = []
+            candidatos_sem_hora = []
+            for title in titulos:
+                resultado = _mapear_resultado(title)
+                horario = _extrair_horario(title)
                 if resultado:
-                    logger.info(f"[SCRAPER] ✅ __NEXT_DATA__ → {resultado} @ {horario}")
-                    return {"resultado": resultado, "horario": horario, "title": titulos[-1]}
-        except Exception:
-            pass
+                    if horario:
+                        candidatos_com_hora.append({"resultado": resultado, "horario": horario, "title": title})
+                    else:
+                        candidatos_sem_hora.append({"resultado": resultado, "horario": None, "title": title})
 
-    # Estratégia 2d: regex direto no HTML cru
-    # Padrão: "BANKER - 7 - 13:09" ou "PLAYER - 5 - 14:22"
-    matches = re.findall(
-        r'(PLAYER|BANKER|TIE)\s*[-–]\s*\d+\s*[-–]\s*(\d{1,2}:\d{2})',
-        html, re.I
-    )
-    if matches:
-        tipo, hora = matches[-1]
-        resultado = _mapear_resultado(tipo)
-        logger.info(f"[SCRAPER] ✅ regex HTML → {resultado} @ {hora}")
-        return {"resultado": resultado, "horario": hora, "title": f"{tipo} - {hora}"}
+            if candidatos_com_hora:
+                mais_recente = sorted(candidatos_com_hora, key=lambda x: x["horario"])[-1]
+                logger.info(f"[SCRAPER] ✅ Mais recente: {mais_recente['resultado']} @ {mais_recente['horario']}")
+                return mais_recente
 
-    # Último recurso: qualquer menção a PLAYER/BANKER/TIE no HTML
-    matches2 = re.findall(r'\b(PLAYER|BANKER|TIE)\b', html, re.I)
-    if matches2:
-        resultado = _mapear_resultado(matches2[-1])
-        logger.warning(f"[SCRAPER] ⚠️  Horário não encontrado — usando resultado mais recente: {resultado}")
-        return {"resultado": resultado, "horario": None, "title": matches2[-1]}
+            if candidatos_sem_hora:
+                mais_recente = candidatos_sem_hora[-1]
+                logger.info(f"[SCRAPER] ✅ Mais recente (sem horário): {mais_recente['resultado']}")
+                return mais_recente
 
-    logger.warning("[SCRAPER] ❌ Nenhum resultado encontrado.")
-    logger.debug("[SCRAPER] Primeiros 3000 chars do HTML:\n" + html[:3000])
-    return None
+            logger.warning("[SCRAPER] ❌ Bolinhas encontradas mas sem dados válidos.")
+            return None
+
+    except Exception as e:
+        logger.error(f"[SCRAPER] ❌ Erro no Playwright: {e}")
+        return None
 
 
 # ============================================================
@@ -301,7 +197,7 @@ def coletar_e_salvar():
 
     db = SessionLocal()
     try:
-        db.execute(text("SELECT 1"))  # testa conexão
+        db.execute(text("SELECT 1"))
 
         ultimo = (
             db.query(Resultado)
@@ -309,9 +205,6 @@ def coletar_e_salvar():
             .first()
         )
 
-        # Deduplicação:
-        # - Se tem horário: só salva se resultado+horário for diferente do último
-        # - Se não tem horário: salva sempre que o resultado mudar (ignora repetição do mesmo tipo)
         if ultimo:
             if horario and ultimo.horario == horario and ultimo.resultado == valor:
                 logger.info(f"🔁 Resultado repetido ({valor} @ {horario}) — ignorando.")
@@ -323,7 +216,7 @@ def coletar_e_salvar():
         novo = Resultado(
             resultado=valor,
             horario=horario,
-            fonte="scraping-requests",
+            fonte="scraping-playwright",
             timestamp=datetime.now(timezone.utc),
         )
         db.add(novo)
@@ -341,7 +234,7 @@ def coletar_e_salvar():
 
 
 # ============================================================
-# PING — evita hibernação no Render/Railway free tier
+# PING
 # ============================================================
 
 def ping():
@@ -362,7 +255,7 @@ if __name__ == "__main__":
         coletar_e_salvar,
         "interval",
         seconds=INTERVALO_SEGUNDOS,
-        id="coleta",
+        id="coletar_e_salvar",
         max_instances=1,
         coalesce=True,
     )

@@ -98,8 +98,7 @@ def _extrair_horario(title: str) -> str | None:
 def scrape() -> dict | None:
     """
     Abre o TipMiner com Playwright, aguarda as bolinhas renderizarem
-    (classes bg-cell-player / bg-cell-banker / bg-cell-tie) e retorna
-    o resultado mais recente.
+    e retorna o resultado mais recente.
     """
     try:
         with sync_playwright() as p:
@@ -125,30 +124,64 @@ def scrape() -> dict | None:
             )
             page = context.new_page()
 
+            # Bloqueia recursos desnecessários para carregar mais rápido
+            def bloquear(route):
+                if route.request.resource_type in ("image", "font", "media", "stylesheet"):
+                    route.abort()
+                else:
+                    route.continue_()
+
+            page.route("**/*", bloquear)
+
             logger.info("[SCRAPER] Abrindo TipMiner com Playwright...")
-            page.goto(URL_TIPMINER, wait_until="domcontentloaded", timeout=30000)
+            page.goto(URL_TIPMINER, wait_until="domcontentloaded", timeout=45000)
 
-            # Aguarda aparecer pelo menos uma bolinha de resultado
-            seletor = "div.bg-cell-player, div.bg-cell-banker, div.bg-cell-tie"
+            # Aguarda a rede ficar quieta (dados carregados via JS)
             try:
-                page.wait_for_selector(seletor, timeout=20000)
-                logger.info("[SCRAPER] Bolinhas de resultado encontradas ✅")
+                page.wait_for_load_state("networkidle", timeout=15000)
             except PlaywrightTimeout:
-                logger.warning("[SCRAPER] ⚠️  Timeout aguardando bolinhas — tentando mesmo assim...")
+                pass  # tudo bem, tenta mesmo assim
 
-            # Coleta todos os títulos das bolinhas
-            titulos = page.eval_on_selector_all(
-                seletor,
-                "elements => elements.map(e => e.getAttribute('title')).filter(Boolean)"
-            )
+            # Tenta os seletores em ordem de especificidade
+            seletores = [
+                "div.bg-cell-player, div.bg-cell-banker, div.bg-cell-tie",
+                "[class*='bg-cell-player'], [class*='bg-cell-banker'], [class*='bg-cell-tie']",
+                "[title*='PLAYER'], [title*='BANKER'], [title*='TIE']",
+            ]
+
+            titulos = []
+            for seletor in seletores:
+                try:
+                    page.wait_for_selector(seletor, timeout=10000)
+                    titulos = page.eval_on_selector_all(
+                        seletor,
+                        "els => els.map(e => e.getAttribute('title')).filter(t => t && (t.includes('PLAYER') || t.includes('BANKER') || t.includes('TIE')))"
+                    )
+                    if titulos:
+                        logger.info(f"[SCRAPER] ✅ {len(titulos)} bolinhas via seletor: {seletor[:40]}")
+                        break
+                except PlaywrightTimeout:
+                    logger.warning(f"[SCRAPER] Seletor não encontrado: {seletor[:40]}")
+                    continue
+
+            # Se ainda não achou, loga o HTML para debug
+            if not titulos:
+                html_debug = page.content()
+                logger.warning(f"[SCRAPER] ❌ Nenhuma bolinha. HTML={len(html_debug)} bytes")
+                # Tenta regex no HTML renderizado como último recurso
+                matches = re.findall(
+                    r'title="((?:PLAYER|BANKER|TIE)[^"]*)"',
+                    html_debug, re.I
+                )
+                if matches:
+                    titulos = matches
+                    logger.info(f"[SCRAPER] ✅ {len(titulos)} bolinhas via regex no HTML renderizado")
 
             browser.close()
 
             if not titulos:
-                logger.warning("[SCRAPER] ❌ Nenhuma bolinha encontrada no HTML renderizado.")
+                logger.warning("[SCRAPER] ❌ Nenhum resultado encontrado no HTML renderizado.")
                 return None
-
-            logger.info(f"[SCRAPER] {len(titulos)} bolinhas encontradas.")
 
             candidatos_com_hora = []
             candidatos_sem_hora = []

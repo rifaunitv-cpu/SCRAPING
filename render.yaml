@@ -1,0 +1,10 @@
+services:
+  - type: worker
+    name: bacbo-coletor
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: COLLECT_INTERVAL_SECONDS
+        value: "30"

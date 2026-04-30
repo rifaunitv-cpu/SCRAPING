@@ -1,0 +1,7 @@
+requests==2.32.3
+beautifulsoup4==4.12.3
+lxml==5.2.2
+apscheduler==3.10.4
+sqlalchemy==2.0.30
+psycopg2-binary==2.9.9
+python-dotenv==1.0.1

@@ -233,7 +233,7 @@ def scrape() -> dict | None:
     matches2 = re.findall(r'\b(PLAYER|BANKER|TIE)\b', html, re.I)
     if matches2:
         resultado = _mapear_resultado(matches2[-1])
-        logger.warning(f"[SCRAPER] ⚠️  Apenas tipo encontrado (sem horário): {resultado}")
+        logger.warning(f"[SCRAPER] ⚠️  Horário não encontrado — usando resultado mais recente: {resultado}")
         return {"resultado": resultado, "horario": None, "title": matches2[-1]}
 
     logger.warning("[SCRAPER] ❌ Nenhum resultado encontrado.")
@@ -269,12 +269,12 @@ def coletar_e_salvar():
 
         # Deduplicação:
         # - Se tem horário: só salva se resultado+horário for diferente do último
-        # - Se não tem horário: salva sempre que o resultado mudar
+        # - Se não tem horário: salva sempre que o resultado mudar (ignora repetição do mesmo tipo)
         if ultimo:
             if horario and ultimo.horario == horario and ultimo.resultado == valor:
                 logger.info(f"🔁 Resultado repetido ({valor} @ {horario}) — ignorando.")
                 return
-            if not horario and ultimo.resultado == valor and ultimo.horario is None:
+            if not horario and ultimo.resultado == valor:
                 logger.info(f"🔁 Resultado repetido ({valor} sem horário) — ignorando.")
                 return
 
@@ -286,7 +286,10 @@ def coletar_e_salvar():
         )
         db.add(novo)
         db.commit()
-        logger.info(f"💾 Salvo: {valor} @ {horario}")
+        if horario:
+            logger.info(f"💾 Salvo: {valor} @ {horario}")
+        else:
+            logger.info(f"💾 Salvo: {valor} (sem horário — resultado mais recente da página)")
 
     except Exception as e:
         db.rollback()

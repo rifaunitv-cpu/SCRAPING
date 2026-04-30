@@ -40,8 +40,16 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept-Language": "pt-BR,pt;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
 }
 
 if not DATABASE_URL:
@@ -166,7 +174,41 @@ def scrape() -> dict | None:
     html = resp.text
     soup = BeautifulSoup(html, "html.parser")
 
-    # Estratégia 2a: qualquer tag com atributo title contendo PLAYER/BANKER/TIE + horário
+    # Estratégia 2a: divs com classe bg-cell-player / bg-cell-banker / bg-cell-tie
+    # Estrutura real do TipMiner: <div class="... bg-cell-player ..." title="PLAYER - 6 - 15:24">
+    CLASSES_CELULA = ["bg-cell-player", "bg-cell-banker", "bg-cell-tie"]
+    candidatos_css = []
+    for classe in CLASSES_CELULA:
+        for tag in soup.find_all(class_=re.compile(classe)):
+            title = tag.get("title", "")
+            resultado = _mapear_resultado(title)
+            horario = _extrair_horario(title)
+            if resultado:
+                candidatos_css.append({
+                    "resultado": resultado,
+                    "horario": horario,
+                    "title": title,
+                })
+
+    if candidatos_css:
+        com_hora = [c for c in candidatos_css if c["horario"]]
+        sem_hora = [c for c in candidatos_css if not c["horario"]]
+        if com_hora:
+            mais_recente = sorted(com_hora, key=lambda x: x["horario"])[-1]
+            logger.info(
+                f"[SCRAPER] ✅ {len(com_hora)} resultados (bg-cell+horario). "
+                f"Mais recente: {mais_recente['resultado']} @ {mais_recente['horario']}"
+            )
+            return mais_recente
+        else:
+            mais_recente = sem_hora[-1]
+            logger.info(
+                f"[SCRAPER] ✅ {len(sem_hora)} resultados (bg-cell sem horario). "
+                f"Mais recente: {mais_recente['resultado']}"
+            )
+            return mais_recente
+
+    # Estratégia 2b: qualquer tag com atributo title contendo PLAYER/BANKER/TIE + horário
     candidatos = []
     for tag in soup.find_all(title=True):
         title = tag.get("title", "")
@@ -183,7 +225,7 @@ def scrape() -> dict | None:
         )
         return mais_recente
 
-    # Estratégia 2b: title sem horário (aceita mesmo sem hora)
+    # Estratégia 2c: title sem horário (aceita mesmo sem hora)
     candidatos_sem_hora = []
     for tag in soup.find_all(title=True):
         title = tag.get("title", "")
